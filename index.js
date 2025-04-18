@@ -2,6 +2,9 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
 
 // Inicializa o cliente do WhatsApp
 const client = new Client({
@@ -245,4 +248,12 @@ client.on('message', async (message) => {
 });
 
 // Inicia o cliente
-client.initialize(); 
+client.initialize();
+
+app.get('/', (req, res) => {
+    res.send('LembreZap rodando!');
+  });
+  
+app.listen(PORT, () => {
+    console.log(`Servidor HTTP iniciado na porta ${PORT}`);
+});
