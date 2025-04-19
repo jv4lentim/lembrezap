@@ -5,3 +5,4 @@ tasks.json
 shopping_list.json
 package-lock.json
 yarn.lock 
+./.env

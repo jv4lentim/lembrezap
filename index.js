@@ -5,6 +5,7 @@ const express = require('express');
 const cron = require('node-cron');
 const dotenv = require('dotenv');
 const moment = require('moment-timezone');
+const OpenAI = require('openai');
 const activeCrons = []
 
 // Carrega as variáveis de ambiente
@@ -12,6 +13,11 @@ dotenv.config();
 
 // Configura o moment para português do Brasil
 moment.locale('pt-br');
+
+// Inicializa o cliente OpenAI
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -409,61 +415,85 @@ function showUserReminders(message, showOptions = true) {
     }
 }
 
-// Função para processar a data informada pelo usuário
-function parseDateFromUserInput(dateText) {
-    // Remove espaços extras e converte para minúsculas
-    dateText = dateText.trim().toLowerCase();
-    
-    // Mapa de dias da semana para números (0 = domingo, 1 = segunda, etc)
-    const weekDays = {
-        'domingo': 0, 'dom': 0,
-        'segunda': 1, 'segunda-feira': 1, 'seg': 1,
-        'terça': 2, 'terca': 2, 'terça-feira': 2, 'ter': 2,
-        'quarta': 3, 'quarta-feira': 3, 'qua': 3,
-        'quinta': 4, 'quinta-feira': 4, 'qui': 4,
-        'sexta': 5, 'sexta-feira': 5, 'sex': 5,
-        'sábado': 6, 'sabado': 6, 'sab': 6
-    };
+// Função para processar os títulos dos lembretes com IA
+async function processReminderTitlesWithAI(rawText) {
+    try {
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            temperature: 0.7,
+            response_format: { type: "json_object" },
+            messages: [
+                {
+                    role: "system",
+                    content: "Você deve reformular cada item da lista de lembretes para torná-los mais claros e descritivos. Retorne um objeto JSON com uma array 'reminders' contendo as strings reformuladas."
+                },
+                {
+                    role: "user",
+                    content: `Reformule estes lembretes, separados por vírgula: "${rawText}"`
+                }
+            ]
+        });
 
-    // Regex para data no formato DD/MM
-    const dateRegex = /^(\d{1,2})\/(\d{1,2})$/;
-    
-    // Inicializa a data base como hoje às 08:00
-    let targetDate = moment().tz('America/Sao_Paulo').hour(8).minute(0).second(0);
-    
-    // Se for um dia da semana
-    if (dateText in weekDays) {
-        const targetDay = weekDays[dateText];
-        const currentDay = targetDate.day();
+        const result = JSON.parse(completion.choices[0].message.content);
+        return result.reminders;
+    } catch (error) {
+        console.error('Erro ao processar lembretes com IA:', error);
+        // Em caso de erro, retorna a lista original dividida por vírgula
+        return rawText.split(',').map(item => item.trim());
+    }
+}
+
+// Função para interpretar datas com IA
+async function interpretDateWithAI(text) {
+    try {
+        const currentDateTime = moment().tz('America/Sao_Paulo').format('DD/MM/YYYY HH:mm');
         
-        // Calcula quantos dias adicionar para chegar ao dia desejado
-        let daysToAdd = targetDay - currentDay;
-        if (daysToAdd <= 0 || (daysToAdd === 0 && targetDate.hour() >= 8)) {
-            daysToAdd += 7;
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            temperature: 0.7,
+            response_format: { type: "json_object" },
+            messages: [
+                {
+                    role: "system",
+                    content: `Você é um assistente que interpreta datas fornecidas de forma informal por usuários brasileiros.
+
+Tarefa:
+- Receba um texto curto (ex: "Terca feita", "sabadu", "23/4") e interprete como uma data no futuro.
+- Corrija erros ortográficos comuns em dias da semana ou datas informais.
+- Sempre converta para o formato ISO \`YYYY-MM-DDT08:00:00-03:00\`, fixando a hora para 08:00 da manhã (fuso horário: America/Sao_Paulo).
+- A data deve estar no futuro. Se a entrada for ambígua ou passada, retorne \`invalid_date: true\`.
+
+Exemplos:
+Entrada: "Terca feita" → Resultado: { "date_iso": "2025-04-22T08:00:00-03:00", "invalid_date": false }
+Entrada: "23/4" → Resultado: { "date_iso": "2025-04-23T08:00:00-03:00", "invalid_date": false }
+Entrada: "sabado" → Resultado: { "date_iso": "2025-04-26T08:00:00-03:00", "invalid_date": false }
+Entrada: "ontem" → Resultado: { "invalid_date": true }
+
+Responda apenas com um JSON válido com os campos:
+- date_iso (se válido)
+- invalid_date (true ou false)
+
+Data e hora atual: ${currentDateTime}`
+                },
+                {
+                    role: "user",
+                    content: `Interprete esta data: "${text}"`
+                }
+            ]
+        });
+
+        const result = JSON.parse(completion.choices[0].message.content);
+        
+        // Se a data for inválida, retorna null
+        if (result.invalid_date) {
+            return null;
         }
-        
-        targetDate.add(daysToAdd, 'days');
+
+        return result.date_iso;
+    } catch (error) {
+        console.error('Erro ao interpretar data com IA:', error);
+        return null;
     }
-    // Se for uma data específica (DD/MM)
-    else if (dateRegex.test(dateText)) {
-        const [, day, month] = dateText.match(dateRegex);
-        
-        // Configura a data alvo
-        targetDate.date(parseInt(day));
-        targetDate.month(parseInt(month) - 1);
-        
-        // Se a data já passou este ano, adiciona um ano
-        if (targetDate.isBefore(moment(), 'day') || 
-            (targetDate.isSame(moment(), 'day') && moment().hour() >= 8)) {
-            targetDate.add(1, 'year');
-        }
-    }
-    // Data inválida
-    else {
-        return { date_iso: null };
-    }
-    
-    return { date_iso: targetDate.format() };
 }
 
 // Função para processar lembrete com data
@@ -498,7 +528,8 @@ async function handleAddingReminderTitle(message) {
 
     // Se estiver no estado inicial de adicionar lembrete
     if (userState.state === STATES.REMINDERS_ADDING) {
-        const reminders = body.split(',').map(r => r.trim()).filter(r => r);
+        // Processa os lembretes com IA
+        const reminders = await processReminderTitlesWithAI(body);
         
         if (reminders.length === 0) {
             message.reply("❌ Nenhum lembrete válido fornecido. Por favor, tente novamente.");
@@ -514,17 +545,17 @@ async function handleAddingReminderTitle(message) {
     if (userState.state === STATES.REMINDERS_ADDING_DATE) {
         const { tempReminder, remainingReminders, processedReminders } = userState;
         
-        // Processa o lembrete com a data fornecida
-        const { date_iso } = parseDateFromUserInput(body);
+        // Processa o lembrete com a data fornecida usando IA
+        const date_iso = await interpretDateWithAI(body);
         
         // Se a data for inválida
         if (!date_iso) {
-            message.reply("❌ Data inválida. Por favor, envie uma data no formato 'DD/MM' ou um dia da semana (ex: 'terça-feira').");
+            message.reply("❌ Data inválida ou passada. Por favor, envie uma data futura no formato 'DD/MM' ou um dia da semana (ex: 'terça-feira').");
             return;
         }
         
         // Formata o título do lembrete (primeira letra maiúscula)
-        const formatted_title = tempReminder.charAt(0).toUpperCase() + tempReminder.slice(1).toLowerCase();
+        const formatted_title = tempReminder.charAt(0).toUpperCase() + tempReminder.slice(1);
         
         // Salva o lembrete
         saveReminder(from, { formatted_title, date_iso }, true);
