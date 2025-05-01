@@ -99,13 +99,11 @@ const STATE_OPTIONS = {
 const userStates = new Map();
 
 // Função para enviar mensagens via Whapi.Cloud
-async function sendMessage(chatId, text) {
+async function sendMessage(chatId, messageText) {
     try {
-      console.log(`📤 Enviando mensagem para ${chatId}: ${text.substring(0, 50)}...`);
-      
       const response = await whapiClient.post('/messages/text', {
-        to: chatId, // <-- CORRIGIDO aqui
-        text: text
+        to: chatId,
+        body: messageText  // <-- Aqui está o campo correto
       });
   
       console.log(`✅ Mensagem enviada com sucesso para ${chatId}`);
@@ -115,11 +113,12 @@ async function sendMessage(chatId, text) {
         statusCode: error.response?.status,
         error: error.response?.data?.error || error.message,
         chatId,
-        textPreview: text.substring(0, 50)
+        bodyPreview: messageText.substring(0, 50)
       });
       throw error;
     }
-  }
+  }  
+      
   
 
 // Endpoint para receber webhooks do Whapi.Cloud
