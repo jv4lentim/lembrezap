@@ -1,11 +1,10 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const fs = require('fs');
 const express = require('express');
+const fs = require('fs');
 const cron = require('node-cron');
 const dotenv = require('dotenv');
 const moment = require('moment-timezone');
 const OpenAI = require('openai');
+const axios = require('axios');
 const activeCrons = []
 
 // Carrega as variáveis de ambiente
@@ -20,13 +19,12 @@ const openai = new OpenAI({
 });
 
 const app = express();
+app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // Arquivos de dados
 const SHOPPING_LIST_FILE = 'shopping_list.json';
 const REMINDERS_FILE = 'reminders.json';
-
-// Arquivo para persistência dos cron jobs
 const CRONS_FILE = 'crons.json';
 
 const CONTEXTS = {
@@ -80,12 +78,134 @@ const STATE_OPTIONS = {
 // Armazena o estado da conversa para cada usuário
 const userStates = new Map();
 
-// Inicializa o cliente do WhatsApp
-const client = new Client({
-    authStrategy: new LocalAuth({ clientId: "client-one" }),
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox']
+// Função para enviar mensagens via Whapi.Cloud
+async function sendMessage(chatId, text) {
+    try {
+        const response = await axios.post('https://gate.whapi.cloud/messages/text', 
+            { chatId, text },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.WHAPI_TOKEN}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        return response.data;
+    } catch (error) {
+        console.error('Erro ao enviar mensagem:', error.response?.data || error.message);
+        throw error;
+    }
+}
+
+// Endpoint para receber webhooks do Whapi.Cloud
+app.post('/webhook', async (req, res) => {
+    try {
+        const { messages } = req.body;
+        
+        if (!messages || !Array.isArray(messages)) {
+            return res.status(400).json({ error: 'Payload inválido' });
+        }
+
+        // Processa cada mensagem recebida
+        for (const message of messages) {
+            // Ignora mensagens enviadas pelo bot
+            if (message.from_me === true) {
+                continue;
+            }
+
+            const from = message.chat_id;
+            const body = message.text?.body;
+
+            if (!body) {
+                continue;
+            }
+
+            // Cria um objeto de mensagem compatível com a lógica existente
+            const compatMessage = {
+                from,
+                body,
+                reply: async (text) => await sendMessage(from, text)
+            };
+
+            // Obtém o estado atual do usuário
+            const userState = userStates.get(from) || { context: CONTEXTS.MAIN, state: STATES.MAIN_MENU };
+            const input = body.trim();
+
+            // Comando menu sempre disponível
+            if (input.toLowerCase() === 'menu') {
+                await sendMessage(from, showMenu(from));
+                continue;
+            }
+
+            // Tenta converter input para número
+            const numericInput = parseInt(input);
+
+            // Processa a mensagem com base no contexto atual
+            switch (userState.context) {
+                case CONTEXTS.MAIN:
+                    switch (userState.state) {
+                        case STATES.MAIN_MENU:
+                            switch (numericInput) {
+                                case 1: // Lista de compras
+                                    await sendMessage(from, showShoppingMenu(from));
+                                    break;
+                                case 2: // Lembretes
+                                    await sendMessage(from, showRemindersMenu(from));
+                                    break;
+                                default:
+                                    await sendMessage(from, `❌ Opção inválida.\n\n${showOptionsForState(STATES.MAIN_MENU)}`);
+                                    userStates.set(from, { context: CONTEXTS.MAIN, state: STATES.MAIN_MENU });
+                            }
+                            break;
+                    }
+                    break;
+
+                case CONTEXTS.SHOPPING:
+                    switch (userState.state) {
+                        case STATES.SHOPPING_MENU:
+                            await handleShoppingMenuState(compatMessage, numericInput);
+                            break;
+                        case STATES.SHOPPING_ADDING_ITEMS:
+                            if (numericInput) {
+                                await handleAddingItemsOptions(compatMessage, numericInput);
+                            } else {
+                                await handleAddingItems(compatMessage);
+                            }
+                            break;
+                        case STATES.SHOPPING_REMOVING_ITEM:
+                            await handleRemovingItem(compatMessage, numericInput);
+                            break;
+                        case STATES.SHOPPING_CONFIRM_CLEAR:
+                            await handleConfirmClear(compatMessage, numericInput);
+                            break;
+                    }
+                    break;
+
+                case CONTEXTS.REMINDERS:
+                    switch (userState.state) {
+                        case STATES.REMINDERS_MENU:
+                            await handleRemindersMenuState(compatMessage, numericInput);
+                            break;
+                        case STATES.REMINDERS_ADDING:
+                        case STATES.REMINDERS_CONFIRM_REMINDER:
+                        case STATES.REMINDERS_ADDING_DATE:
+                            await handleAddingReminderTitle(compatMessage);
+                            break;
+                        case STATES.REMINDERS_REMOVING:
+                            await handleRemovingReminder(compatMessage, numericInput);
+                            break;
+                        case STATES.REMINDERS_CONFIRM_CLEAR:
+                            await handleConfirmClearReminders(compatMessage, numericInput);
+                            break;
+                    }
+                    break;
+            }
+        }
+
+        res.status(200).json({ status: 'OK' });
+    } catch (error) {
+        console.error('Erro ao processar webhook:', error);
+        res.status(500).json({ error: 'Erro interno do servidor' });
     }
 });
 
@@ -152,267 +272,6 @@ function showShoppingList(from, showOptions = true) {
     }
 
     return message;
-}
-
-// Eventos do cliente WhatsApp
-client.on('qr', (qr) => {
-    console.log('QR Code gerado! Escaneie-o com seu WhatsApp:');
-    qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    console.log('Bot está conectado e pronto para uso!');
-
-    // Restaura os cron jobs agendados
-    restoreScheduledCrons();
-
-    // Configura o cron job para executar às 8h da manhã
-    cron.schedule('0 8 * * *', () => {
-        sendDailyReminders();
-    }, {
-        timezone: 'America/Sao_Paulo'
-    });
-});
-
-client.on('message', async (message) => {
-    const { from, body } = message;
-    const userState = userStates.get(from) || { context: CONTEXTS.MAIN, state: STATES.MAIN_MENU };
-    const input = body.trim();
-
-    // Comando menu sempre disponível
-    if (input.toLowerCase() === 'menu') {
-        message.reply(showMenu(from));
-        return;
-    }
-
-    // Tenta converter input para número
-    const numericInput = parseInt(input);
-
-    switch (userState.context) {
-        case CONTEXTS.MAIN:
-            switch (userState.state) {
-                case STATES.MAIN_MENU:
-                    switch (numericInput) {
-                        case 1: // Lista de compras
-                            message.reply(showShoppingMenu(from));
-                            break;
-                        case 2: // Lembretes
-                            message.reply(showRemindersMenu(from));
-                            break;
-                        default:
-                            message.reply(`❌ Opção inválida.\n\n${showOptionsForState(STATES.MAIN_MENU)}`);
-                            userStates.set(from, { context: CONTEXTS.MAIN, state: STATES.MAIN_MENU });
-                    }
-                    break;
-            }
-            break;
-
-        case CONTEXTS.SHOPPING:
-            switch (userState.state) {
-                case STATES.SHOPPING_MENU:
-                    handleShoppingMenuState(message, numericInput);
-                    break;
-                case STATES.SHOPPING_ADDING_ITEMS:
-                    if (numericInput) {
-                        handleAddingItemsOptions(message, numericInput);
-                    } else {
-                        handleAddingItems(message);
-                    }
-                    break;
-                case STATES.SHOPPING_REMOVING_ITEM:
-                    handleRemovingItem(message, numericInput);
-                    break;
-                case STATES.SHOPPING_CONFIRM_CLEAR:
-                    handleConfirmClear(message, numericInput);
-                    break;
-            }
-            break;
-
-        case CONTEXTS.REMINDERS:
-            switch (userState.state) {
-                case STATES.REMINDERS_MENU:
-                    handleRemindersMenuState(message, numericInput);
-                    break;
-                case STATES.REMINDERS_ADDING:
-                case STATES.REMINDERS_CONFIRM_REMINDER:
-                case STATES.REMINDERS_ADDING_DATE:
-                    await handleAddingReminderTitle(message);
-                    break;
-                case STATES.REMINDERS_REMOVING:
-                    handleRemovingReminder(message, numericInput);
-                    break;
-                case STATES.REMINDERS_CONFIRM_CLEAR:
-                    handleConfirmClearReminders(message, numericInput);
-                    break;
-            }
-            break;
-    }
-});
-
-function handleShoppingMenuState(message, option) {
-    const { from } = message;
-
-    switch (option) {
-        case 1: // Ver lista
-            message.reply(showShoppingList(from));
-            break;
-
-        case 2: // Adicionar items
-            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_ADDING_ITEMS });
-            message.reply("➕ Digite os itens que deseja adicionar, separados por vírgula:");
-            break;
-
-        case 3: // Remover item
-            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_REMOVING_ITEM });
-            message.reply(`${showShoppingList(from, false)}\n\n❌ Digite o número do item que deseja remover:`);
-            break;
-
-        case 4: // Limpar lista
-            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_CONFIRM_CLEAR });
-            message.reply("⚠️ Tem certeza que deseja limpar toda a lista?\n1. ✅ Sim\n2. ❌ Não");
-            break;
-
-        case 5: // Voltar ao menu principal
-            message.reply(showMenu(from));
-            break;
-
-        default:
-            message.reply(`❌ Opção inválida.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
-    }
-}
-
-function handleRemindersMenuState(message, option) {
-    const { from } = message;
-
-    switch (option) {
-        case 1: // Ver lembretes
-            showUserReminders(message);
-            break;
-
-        case 2: // Adicionar lembrete
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_ADDING });
-            message.reply("🔔 Digite o lembrete que deseja salvar (você pode adicionar vários separados por vírgula).\n\nExemplos:\n- Ir ao dentista\n- Comprar ração para o cachorro\n- Buscar camisa na lavanderia");
-            break;
-
-        case 3: // Remover lembrete
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_REMOVING });
-            message.reply(`${showUserReminders(message, false)}\n\n❌ Digite o número do lembrete que deseja remover:`);
-            break;
-
-        case 4: // Limpar todos os lembretes
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_CONFIRM_CLEAR });
-            message.reply("⚠️ Tem certeza que deseja limpar todos os lembretes?\n1. ✅ Sim\n2. ❌ Não");
-            break;
-
-        case 5: // Voltar ao menu principal
-            message.reply(showMenu(from));
-            break;
-
-        default:
-            message.reply(`❌ Opção inválida.\n\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
-    }
-}
-
-function handleAddingItemsOptions(message, option) {
-    const { from } = message;
-
-    switch (option) {
-        case 1: // Ver lista
-            message.reply(showShoppingList(from));
-            break;
-
-        case 2: // Adicionar mais
-            userStates.set(from, { state: STATES.SHOPPING_ADDING_ITEMS });
-            message.reply("➕ Digite os itens que deseja adicionar, separados por vírgula:");
-            break;
-
-        case 3: // Remover item
-            userStates.set(from, { state: STATES.SHOPPING_REMOVING_ITEM });
-            message.reply(`${showShoppingList(from, false)}\n\n❌ Digite o número do item que deseja remover:`);
-            break;
-
-        case 4: // Voltar ao menu principal
-            message.reply(showMenu(from));
-            break;
-
-        default:
-            message.reply(`❌ Opção inválida.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-    }
-}
-
-function handleAddingItems(message) {
-    const { from, body } = message;
-    const items = body.split(',').map(item => item.trim()).filter(item => item);
-
-    if (items.length > 0) {
-        const list = loadJsonFile(SHOPPING_LIST_FILE);
-        list.push(...items);
-        saveJsonFile(SHOPPING_LIST_FILE, list);
-        message.reply(`✅ Itens adicionados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-    } else {
-        message.reply(`❌ Nenhum item válido fornecido.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-    }
-}
-
-function handleRemovingItem(message, index) {
-    const { from } = message;
-    const list = loadJsonFile(SHOPPING_LIST_FILE);
-    index = index - 1;
-
-    if (index >= 0 && index < list.length) {
-        const removedItem = list.splice(index, 1)[0];
-        saveJsonFile(SHOPPING_LIST_FILE, list);
-        message.reply(`✅ Item "${removedItem}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
-    } else {
-        message.reply(`❌ Número inválido.\n\n${showShoppingList(from, false)}\n\nDigite o número do item que deseja remover:`);
-    }
-}
-
-function handleConfirmClear(message, option) {
-    const { from } = message;
-
-    if (option === 1) {
-        saveJsonFile(SHOPPING_LIST_FILE, []);
-        message.reply(`✅ Lista limpa com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
-    } else if (option === 2) {
-        message.reply(`🚫 Operação cancelada.\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
-    } else {
-        message.reply("❌ Opção inválida.\n1. ✅ Sim\n2. ❌ Não");
-    }
-}
-
-// Função para mostrar os lembretes do usuário
-function showUserReminders(message, showOptions = true) {
-    const { from } = message;
-    const reminders = loadJsonFile(REMINDERS_FILE);
-    const userReminders = reminders.filter(reminder => reminder.from === from);
-
-    if (userReminders.length === 0) {
-        message.reply("📋 Você ainda não tem nenhum lembrete cadastrado.\n\nO que deseja fazer agora?\n" + showOptionsForState(STATES.REMINDERS_MENU));
-        return;
-    }
-
-    const remindersList = userReminders
-        .map((reminder, index) => {
-            const date = moment.tz(reminder.date_iso, 'America/Sao_Paulo');
-            const formattedDate = date.format('DD/MM/YYYY');
-            return `${index + 1}. ${reminder.title} - ${formattedDate}`;
-        })
-        .join('\n');
-
-    const response = `📋 Seus lembretes:\n\n${remindersList}`;
-    
-    if (showOptions) {
-        message.reply(`${response}\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
-    } else {
-        return response;
-    }
 }
 
 // Função para processar os títulos dos lembretes com IA
@@ -496,13 +355,43 @@ Data e hora atual: ${currentDateTime}`
     }
 }
 
+// Função para mostrar os lembretes do usuário
+async function showUserReminders(message, showOptions = true) {
+    const { from } = message;
+    const reminders = loadJsonFile(REMINDERS_FILE);
+    const userReminders = reminders.filter(reminder => reminder.from === from);
+
+    if (userReminders.length === 0) {
+        if (showOptions) {
+            await sendMessage(from, "📋 Você ainda não tem nenhum lembrete cadastrado.\n\nO que deseja fazer agora?\n" + showOptionsForState(STATES.REMINDERS_MENU));
+        }
+        return "📋 Você ainda não tem nenhum lembrete cadastrado.";
+    }
+
+    const remindersList = userReminders
+        .map((reminder, index) => {
+            const date = moment.tz(reminder.date_iso, 'America/Sao_Paulo');
+            const formattedDate = date.format('DD/MM/YYYY');
+            return `${index + 1}. ${reminder.title} - ${formattedDate}`;
+        })
+        .join('\n');
+
+    const response = `📋 Seus lembretes:\n\n${remindersList}`;
+    
+    if (showOptions) {
+        await sendMessage(from, `${response}\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
+    }
+    return response;
+}
+
 // Função para processar lembrete com data
 async function processNextReminder(message, reminders, processedReminders = []) {
     const { from } = message;
     
     // Se não há mais lembretes para processar, mostra o resumo e retorna ao menu
     if (reminders.length === 0) {
-        message.reply(`O que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        await sendMessage(from, `O que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
         userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
         return;
     }
@@ -519,7 +408,7 @@ async function processNextReminder(message, reminders, processedReminders = []) 
         remainingReminders,
         processedReminders
     });
-    message.reply(`📅 Quando você quer ser lembrado sobre: "${currentReminder}"?\nInforme apenas o dia (ex: "terça-feira", "25/04").`);
+    await sendMessage(from, `📅 Quando você quer ser lembrado sobre: "${currentReminder}"?\nInforme apenas o dia (ex: "terça-feira", "25/04").`);
 }
 
 async function handleAddingReminderTitle(message) {
@@ -597,7 +486,7 @@ async function sendDailyReminders() {
             const message = `🔔 Bom dia! Aqui estão seus lembretes de hoje:\n\n${remindersList}`;
             
             try {
-                await client.sendMessage(from, message);
+                await sendMessage(from, message);
                 console.log(`✅ Lembretes enviados para ${from}`);
             } catch (error) {
                 console.error(`❌ Erro ao enviar lembretes para ${from}:`, error);
@@ -644,7 +533,7 @@ function saveReminder(from, reminderData, remember = true) {
         
         const job = cron.schedule(cronExpression, async () => {
             try {
-                await client.sendMessage(from, `🔔 Lembrete: ${reminderData.formatted_title}`);
+                await sendMessage(from, `🔔 Lembrete: ${reminderData.formatted_title}`);
                 console.log(`✅ Lembrete enviado para ${from}`);
                 
                 // Remove o cron após executar
@@ -683,7 +572,7 @@ function restoreScheduledCrons() {
 }
 
 // Função para remover um lembrete
-function handleRemovingReminder(message, index) {
+async function handleRemovingReminder(message, index) {
     const { from } = message;
     const reminders = loadJsonFile(REMINDERS_FILE);
     index = index - 1;
@@ -691,15 +580,15 @@ function handleRemovingReminder(message, index) {
     if (index >= 0 && index < reminders.length) {
         const removedReminder = reminders.splice(index, 1)[0];
         saveJsonFile(REMINDERS_FILE, reminders);
-        message.reply(`✅ Lembrete "${removedReminder.title}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        await sendMessage(from, `✅ Lembrete "${removedReminder.title}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
         userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
     } else {
-        message.reply(`❌ Número inválido.\n\n${showUserReminders(message, false)}`);
+        await sendMessage(from, `❌ Número inválido.\n\n${await showUserReminders(message, false)}`);
     }
 }
 
 // Função para confirmar a remoção de todos os lembretes
-function handleConfirmClearReminders(message, option) {
+async function handleConfirmClearReminders(message, option) {
     const { from } = message;
 
     if (option === 1) {
@@ -713,18 +602,130 @@ function handleConfirmClearReminders(message, option) {
         const updatedCrons = crons.filter(c => c.from !== from);
         saveJsonFile(CRONS_FILE, updatedCrons);
 
-        message.reply(`✅ Todos os seus lembretes foram apagados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        await sendMessage(from, `✅ Todos os seus lembretes foram apagados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
         userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
     } else if (option === 2) {
-        message.reply(`🚫 Operação cancelada.\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        await sendMessage(from, `🚫 Operação cancelada.\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
         userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
     } else {
-        message.reply("❌ Opção inválida.\n1. ✅ Sim\n2. ❌ Não");
+        await sendMessage(from, "❌ Opção inválida.\n1. ✅ Sim\n2. ❌ Não");
     }
 }
 
-// Inicia o cliente
-client.initialize();
+// Funções da lista de compras
+async function handleShoppingMenuState(message, option) {
+    const { from } = message;
+
+    switch (option) {
+        case 1: // Ver lista
+            await sendMessage(from, showShoppingList(from));
+            break;
+
+        case 2: // Adicionar items
+            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_ADDING_ITEMS });
+            await sendMessage(from, "➕ Digite os itens que deseja adicionar, separados por vírgula:");
+            break;
+
+        case 3: // Remover item
+            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_REMOVING_ITEM });
+            await sendMessage(from, `${showShoppingList(from, false)}\n\n❌ Digite o número do item que deseja remover:`);
+            break;
+
+        case 4: // Limpar lista
+            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_CONFIRM_CLEAR });
+            await sendMessage(from, "⚠️ Tem certeza que deseja limpar toda a lista?\n1. ✅ Sim\n2. ❌ Não");
+            break;
+
+        case 5: // Voltar ao menu principal
+            await sendMessage(from, showMenu(from));
+            break;
+
+        default:
+            await sendMessage(from, `❌ Opção inválida.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+            userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
+    }
+}
+
+async function handleAddingItemsOptions(message, option) {
+    const { from } = message;
+
+    switch (option) {
+        case 1: // Ver lista
+            await sendMessage(from, showShoppingList(from));
+            break;
+
+        case 2: // Adicionar mais
+            userStates.set(from, { state: STATES.SHOPPING_ADDING_ITEMS });
+            await sendMessage(from, "➕ Digite os itens que deseja adicionar, separados por vírgula:");
+            break;
+
+        case 3: // Remover item
+            userStates.set(from, { state: STATES.SHOPPING_REMOVING_ITEM });
+            await sendMessage(from, `${showShoppingList(from, false)}\n\n❌ Digite o número do item que deseja remover:`);
+            break;
+
+        case 4: // Voltar ao menu principal
+            await sendMessage(from, showMenu(from));
+            break;
+
+        default:
+            await sendMessage(from, `❌ Opção inválida.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+    }
+}
+
+async function handleAddingItems(message) {
+    const { from, body } = message;
+    const items = body.split(',').map(item => item.trim()).filter(item => item);
+
+    if (items.length > 0) {
+        const list = loadJsonFile(SHOPPING_LIST_FILE);
+        list.push(...items);
+        saveJsonFile(SHOPPING_LIST_FILE, list);
+        await sendMessage(from, `✅ Itens adicionados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+    } else {
+        await sendMessage(from, `❌ Nenhum item válido fornecido.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+    }
+}
+
+async function handleRemovingItem(message, index) {
+    const { from } = message;
+    const list = loadJsonFile(SHOPPING_LIST_FILE);
+    index = index - 1;
+
+    if (index >= 0 && index < list.length) {
+        const removedItem = list.splice(index, 1)[0];
+        saveJsonFile(SHOPPING_LIST_FILE, list);
+        await sendMessage(from, `✅ Item "${removedItem}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
+    } else {
+        await sendMessage(from, `❌ Número inválido.\n\n${showShoppingList(from, false)}\n\nDigite o número do item que deseja remover:`);
+    }
+}
+
+async function handleConfirmClear(message, option) {
+    const { from } = message;
+
+    if (option === 1) {
+        saveJsonFile(SHOPPING_LIST_FILE, []);
+        await sendMessage(from, `✅ Lista limpa com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
+    } else if (option === 2) {
+        await sendMessage(from, `🚫 Operação cancelada.\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
+    } else {
+        await sendMessage(from, "❌ Opção inválida.\n1. ✅ Sim\n2. ❌ Não");
+    }
+}
+
+// Configura o cron job para executar às 8h da manhã
+cron.schedule('0 8 * * *', () => {
+    sendDailyReminders();
+}, {
+    timezone: 'America/Sao_Paulo'
+});
+
+// Restaura os cron jobs agendados ao iniciar
+restoreScheduledCrons();
 
 // Configuração do servidor Express
 app.get('/', (req, res) => {
