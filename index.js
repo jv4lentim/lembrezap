@@ -10,12 +10,32 @@ const activeCrons = []
 // Carrega as variáveis de ambiente
 dotenv.config();
 
+// Verifica se as variáveis de ambiente necessárias estão definidas
+if (!process.env.WHAPI_TOKEN) {
+    console.error('❌ Erro: WHAPI_TOKEN não está definido no arquivo .env');
+    process.exit(1);
+}
+
+if (!process.env.OPENAI_API_KEY) {
+    console.error('❌ Erro: OPENAI_API_KEY não está definido no arquivo .env');
+    process.exit(1);
+}
+
 // Configura o moment para português do Brasil
 moment.locale('pt-br');
 
 // Inicializa o cliente OpenAI
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
+});
+
+// Configuração do cliente Axios para o Whapi.Cloud
+const whapiClient = axios.create({
+    baseURL: 'https://gate.whapi.cloud',
+    headers: {
+        'Authorization': `Bearer ${process.env.WHAPI_TOKEN}`,
+        'Content-Type': 'application/json'
+    }
 });
 
 const app = express();
@@ -81,21 +101,26 @@ const userStates = new Map();
 // Função para enviar mensagens via Whapi.Cloud
 async function sendMessage(chatId, text) {
     try {
-        const response = await axios.post('https://gate.whapi.cloud/messages/text', 
-            { chatId, text },
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.WHAPI_TOKEN}`,
-                    'Content-Type': 'application/json'
-                }
-            }
-        );
-        return response.data;
+      console.log(`📤 Enviando mensagem para ${chatId}: ${text.substring(0, 50)}...`);
+      
+      const response = await whapiClient.post('/messages/text', {
+        to: chatId, // <-- CORRIGIDO aqui
+        text: text
+      });
+  
+      console.log(`✅ Mensagem enviada com sucesso para ${chatId}`);
+      return response.data;
     } catch (error) {
-        console.error('Erro ao enviar mensagem:', error.response?.data || error.message);
-        throw error;
+      console.error('❌ Erro ao enviar mensagem:', {
+        statusCode: error.response?.status,
+        error: error.response?.data?.error || error.message,
+        chatId,
+        textPreview: text.substring(0, 50)
+      });
+      throw error;
     }
-}
+  }
+  
 
 // Endpoint para receber webhooks do Whapi.Cloud
 app.post('/webhook', async (req, res) => {
@@ -734,6 +759,27 @@ app.get('/', (req, res) => {
 
 app.get('/healthz', (req, res) => {
     res.status(200).send('OK');
+});
+
+// Endpoint de teste para envio de mensagem
+app.get('/test', async (req, res) => {
+    const { chatId } = req.query;
+    
+    if (!chatId) {
+        return res.status(400).json({ error: 'chatId é obrigatório' });
+    }
+
+    try {
+        await sendMessage(chatId, '🤖 Teste de conexão do LembreZap');
+        res.json({ status: 'OK', message: 'Mensagem de teste enviada com sucesso' });
+    } catch (error) {
+        res.status(500).json({
+            error: 'Erro ao enviar mensagem de teste',
+            details: error.message,
+            statusCode: error.response?.status,
+            apiError: error.response?.data?.error
+        });
+    }
 });
 
 app.listen(PORT, () => {
