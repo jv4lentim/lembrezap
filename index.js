@@ -741,6 +741,41 @@ async function handleConfirmClear(message, option) {
     }
 }
 
+// Função para lidar com o menu de lembretes
+async function handleRemindersMenuState(message, option) {
+    const { from } = message;
+
+    switch (option) {
+        case 1: // Ver lembretes
+            await showUserReminders(message);
+            break;
+
+        case 2: // Adicionar lembrete
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_ADDING });
+            await sendMessage(from, "➕ Digite o(s) lembrete(s) que deseja adicionar, separados por vírgula:");
+            break;
+
+        case 3: // Remover lembrete
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_REMOVING });
+            await showUserReminders(message, false);
+            await sendMessage(from, "\n❌ Digite o número do lembrete que deseja remover:");
+            break;
+
+        case 4: // Limpar todos os lembretes
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_CONFIRM_CLEAR });
+            await sendMessage(from, "⚠️ Tem certeza que deseja apagar todos os seus lembretes?\n1. ✅ Sim\n2. ❌ Não");
+            break;
+
+        case 5: // Voltar ao menu principal
+            await sendMessage(from, showMenu(from));
+            break;
+
+        default:
+            await sendMessage(from, `❌ Opção inválida.\n\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
+    }
+}
+
 // Configura o cron job para executar às 8h da manhã
 cron.schedule('0 8 * * *', () => {
     sendDailyReminders();
