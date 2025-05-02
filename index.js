@@ -5,6 +5,7 @@ const dotenv = require('dotenv');
 const moment = require('moment-timezone');
 const OpenAI = require('openai');
 const axios = require('axios');
+const { shoppingListDb, remindersDb, cronsDb } = require('./database');
 const activeCrons = []
 
 // Carrega as variáveis de ambiente
@@ -281,13 +282,13 @@ function showRemindersMenu(from) {
 
 // Função para mostrar a lista de compras
 function showShoppingList(from, showOptions = true) {
-    const list = loadJsonFile(SHOPPING_LIST_FILE);
+    const list = shoppingListDb.getAll(from);
     let message = '';
     
     if (list.length === 0) {
         message = "📋 Lista vazia.";
     } else {
-        message = `📋 Lista de compras:\n${list.map((item, index) => `${index + 1}. ${item}`).join('\n')}`;
+        message = `📋 Lista de compras:\n${list.map((item, index) => `${index + 1}. ${item.item}`).join('\n')}`;
     }
 
     if (showOptions) {
@@ -382,8 +383,7 @@ Data e hora atual: ${currentDateTime}`
 // Função para mostrar os lembretes do usuário
 async function showUserReminders(message, showOptions = true) {
     const { from } = message;
-    const reminders = loadJsonFile(REMINDERS_FILE);
-    const userReminders = reminders.filter(reminder => reminder.from === from);
+    const userReminders = remindersDb.getAll(from);
 
     if (userReminders.length === 0) {
         if (showOptions) {
@@ -487,15 +487,15 @@ async function handleAddingReminderTitle(message) {
 // Função para enviar lembretes diários
 async function sendDailyReminders() {
     console.log('🔔 Iniciando envio de lembretes diários...');
-    const reminders = loadJsonFile(REMINDERS_FILE);
+    const reminders = remindersDb.getAll();
     
     // Agrupa os lembretes por usuário
     const remindersByUser = reminders.reduce((acc, reminder) => {
         if (reminder.lembrar) {
-            if (!acc[reminder.from]) {
-                acc[reminder.from] = [];
+            if (!acc[reminder.chat_id]) {
+                acc[reminder.chat_id] = [];
             }
-            acc[reminder.from].push(reminder);
+            acc[reminder.chat_id].push(reminder);
         }
         return acc;
     }, {});
@@ -521,17 +521,13 @@ async function sendDailyReminders() {
 
 // Função para salvar um lembrete
 function saveReminder(from, reminderData, remember = true) {
-    const reminders = loadJsonFile(REMINDERS_FILE);
     const reminder = {
         title: reminderData.formatted_title,
-        lembrar: remember,
-        createdAt: new Date().toISOString(),
-        from: from,
-        date_iso: reminderData.date_iso || null
+        date_iso: reminderData.date_iso || null,
+        lembrar: remember
     };
     
-    reminders.push(reminder);
-    saveJsonFile(REMINDERS_FILE, reminders);
+    const result = remindersDb.add(from, reminder);
     
     // Se deve lembrar e tem data, agenda o cron
     if (remember && reminderData.date_iso) {
@@ -552,8 +548,12 @@ function saveReminder(from, reminderData, remember = true) {
         
         console.log(`🔔 Agendando lembrete para ${targetDate.format('DD/MM/YYYY [às] 08:00')}`);
         
-        // Salva o cron job no arquivo
-        saveCronJob(from, reminderData.date_iso, `🔔 Lembrete: ${reminderData.formatted_title}`);
+        // Salva o cron job no banco
+        const cronJob = {
+            message: `🔔 Lembrete: ${reminderData.formatted_title}`,
+            date_iso: reminderData.date_iso
+        };
+        cronsDb.add(from, cronJob);
         
         const job = cron.schedule(cronExpression, async () => {
             try {
@@ -561,13 +561,7 @@ function saveReminder(from, reminderData, remember = true) {
                 console.log(`✅ Lembrete enviado para ${from}`);
                 
                 // Remove o cron após executar
-                const crons = loadJsonFile(CRONS_FILE);
-                const updatedCrons = crons.filter(c => 
-                    c.from !== from || 
-                    c.date_iso !== reminderData.date_iso || 
-                    c.message !== `🔔 Lembrete: ${reminderData.formatted_title}`
-                );
-                saveJsonFile(CRONS_FILE, updatedCrons);
+                cronsDb.remove(from, reminderData.date_iso, `🔔 Lembrete: ${reminderData.formatted_title}`);
                 job.stop();
             } catch (error) {
                 console.error(`❌ Erro ao enviar lembrete para ${from}:`, error);
@@ -578,61 +572,38 @@ function saveReminder(from, reminderData, remember = true) {
     return reminder;
 }
 
-// Função para salvar um cron job
-function saveCronJob(from, date_iso, message) {
-    const crons = loadJsonFile(CRONS_FILE);
-    const cronJob = { from, date_iso, message };
-    crons.push(cronJob);
-    saveJsonFile(CRONS_FILE, crons);
-}
-
-// Função para restaurar os cron jobs agendados
-function restoreScheduledCrons() {
-    const crons = loadJsonFile(CRONS_FILE);
-    for (const cronJob of crons) {
-        const { from, date_iso, message } = cronJob;
-        saveReminder(from, { formatted_title: message, date_iso }, true);
-    }
-}
-
-// Função para remover um lembrete
-async function handleRemovingReminder(message, index) {
-    const { from } = message;
-    const reminders = loadJsonFile(REMINDERS_FILE);
-    index = index - 1;
-
-    if (index >= 0 && index < reminders.length) {
-        const removedReminder = reminders.splice(index, 1)[0];
-        saveJsonFile(REMINDERS_FILE, reminders);
-        await sendMessage(from, `✅ Lembrete "${removedReminder.title}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
-    } else {
-        await sendMessage(from, `❌ Número inválido.\n\n${await showUserReminders(message, false)}`);
-    }
-}
-
-// Função para confirmar a remoção de todos os lembretes
-async function handleConfirmClearReminders(message, option) {
+// Função para lidar com o menu de lembretes
+async function handleRemindersMenuState(message, option) {
     const { from } = message;
 
-    if (option === 1) {
-        // Carrega e filtra os lembretes, mantendo apenas os de outros usuários
-        const reminders = loadJsonFile(REMINDERS_FILE);
-        const updated = reminders.filter(r => r.from !== from);
-        saveJsonFile(REMINDERS_FILE, updated);
+    switch (option) {
+        case 1: // Ver lembretes
+            await showUserReminders(message);
+            break;
 
-        // Atualiza também o arquivo de crons
-        const crons = loadJsonFile(CRONS_FILE);
-        const updatedCrons = crons.filter(c => c.from !== from);
-        saveJsonFile(CRONS_FILE, updatedCrons);
+        case 2: // Adicionar lembrete
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_ADDING });
+            await sendMessage(from, "➕ Digite o(s) lembrete(s) que deseja adicionar, separados por vírgula:");
+            break;
 
-        await sendMessage(from, `✅ Todos os seus lembretes foram apagados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
-    } else if (option === 2) {
-        await sendMessage(from, `🚫 Operação cancelada.\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
-        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
-    } else {
-        await sendMessage(from, "❌ Opção inválida.\n1. ✅ Sim\n2. ❌ Não");
+        case 3: // Remover lembrete
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_REMOVING });
+            await showUserReminders(message, false);
+            await sendMessage(from, "\n❌ Digite o número do lembrete que deseja remover:");
+            break;
+
+        case 4: // Limpar todos os lembretes
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_CONFIRM_CLEAR });
+            await sendMessage(from, "⚠️ Tem certeza que deseja apagar todos os seus lembretes?\n1. ✅ Sim\n2. ❌ Não");
+            break;
+
+        case 5: // Voltar ao menu principal
+            await sendMessage(from, showMenu(from));
+            break;
+
+        default:
+            await sendMessage(from, `❌ Opção inválida.\n\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
     }
 }
 
@@ -702,9 +673,7 @@ async function handleAddingItems(message) {
     const items = body.split(',').map(item => item.trim()).filter(item => item);
 
     if (items.length > 0) {
-        const list = loadJsonFile(SHOPPING_LIST_FILE);
-        list.push(...items);
-        saveJsonFile(SHOPPING_LIST_FILE, list);
+        shoppingListDb.add(from, items);
         await sendMessage(from, `✅ Itens adicionados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
     } else {
         await sendMessage(from, `❌ Nenhum item válido fornecido.\n\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
@@ -713,12 +682,10 @@ async function handleAddingItems(message) {
 
 async function handleRemovingItem(message, index) {
     const { from } = message;
-    const list = loadJsonFile(SHOPPING_LIST_FILE);
     index = index - 1;
 
-    if (index >= 0 && index < list.length) {
-        const removedItem = list.splice(index, 1)[0];
-        saveJsonFile(SHOPPING_LIST_FILE, list);
+    const removedItem = shoppingListDb.remove(from, index);
+    if (removedItem) {
         await sendMessage(from, `✅ Item "${removedItem}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
         userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
     } else {
@@ -730,7 +697,7 @@ async function handleConfirmClear(message, option) {
     const { from } = message;
 
     if (option === 1) {
-        saveJsonFile(SHOPPING_LIST_FILE, []);
+        shoppingListDb.clear(from);
         await sendMessage(from, `✅ Lista limpa com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.SHOPPING_MENU)}`);
         userStates.set(from, { context: CONTEXTS.SHOPPING, state: STATES.SHOPPING_MENU });
     } else if (option === 2) {
@@ -741,38 +708,33 @@ async function handleConfirmClear(message, option) {
     }
 }
 
-// Função para lidar com o menu de lembretes
-async function handleRemindersMenuState(message, option) {
+async function handleRemovingReminder(message, index) {
+    const { from } = message;
+    index = index - 1;
+
+    const removedReminder = remindersDb.remove(from, index);
+    if (removedReminder) {
+        await sendMessage(from, `✅ Lembrete "${removedReminder.title}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
+    } else {
+        await sendMessage(from, `❌ Número inválido.\n\n${await showUserReminders(message, false)}`);
+    }
+}
+
+async function handleConfirmClearReminders(message, option) {
     const { from } = message;
 
-    switch (option) {
-        case 1: // Ver lembretes
-            await showUserReminders(message);
-            break;
+    if (option === 1) {
+        remindersDb.clear(from);
+        cronsDb.clear(from);
 
-        case 2: // Adicionar lembrete
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_ADDING });
-            await sendMessage(from, "➕ Digite o(s) lembrete(s) que deseja adicionar, separados por vírgula:");
-            break;
-
-        case 3: // Remover lembrete
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_REMOVING });
-            await showUserReminders(message, false);
-            await sendMessage(from, "\n❌ Digite o número do lembrete que deseja remover:");
-            break;
-
-        case 4: // Limpar todos os lembretes
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_CONFIRM_CLEAR });
-            await sendMessage(from, "⚠️ Tem certeza que deseja apagar todos os seus lembretes?\n1. ✅ Sim\n2. ❌ Não");
-            break;
-
-        case 5: // Voltar ao menu principal
-            await sendMessage(from, showMenu(from));
-            break;
-
-        default:
-            await sendMessage(from, `❌ Opção inválida.\n\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
-            userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
+        await sendMessage(from, `✅ Todos os seus lembretes foram apagados com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
+    } else if (option === 2) {
+        await sendMessage(from, `🚫 Operação cancelada.\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
+        userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
+    } else {
+        await sendMessage(from, "❌ Opção inválida.\n1. ✅ Sim\n2. ❌ Não");
     }
 }
 
@@ -784,7 +746,15 @@ cron.schedule('0 8 * * *', () => {
 });
 
 // Restaura os cron jobs agendados ao iniciar
-restoreScheduledCrons();
+function restoreScheduledCrons() {
+    const crons = cronsDb.getAll();
+    for (const cronJob of crons) {
+        saveReminder(cronJob.chat_id, {
+            formatted_title: cronJob.message.replace('🔔 Lembrete: ', ''),
+            date_iso: cronJob.date_iso
+        }, true);
+    }
+}
 
 // Configuração do servidor Express
 app.get('/', (req, res) => {
