@@ -34,10 +34,13 @@ function migrateReminders() {
     const reminders = loadJsonFile('reminders.json');
     
     for (const reminder of reminders) {
+        // Garante que lembrar seja um booleano antes de salvar
+        const lembrar = reminder.lembrar !== undefined ? Boolean(reminder.lembrar) : true;
+        
         remindersDb.add(reminder.from || 'legacy_data', {
             title: reminder.title,
             date_iso: reminder.date_iso,
-            lembrar: reminder.lembrar || true
+            lembrar: lembrar
         });
     }
     console.log(`✅ ${reminders.length} lembretes migrados`);

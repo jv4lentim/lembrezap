@@ -89,7 +89,10 @@ const shoppingListDb = {
 const remindersDb = {
     getAll: (chatId) => {
         const stmt = db.prepare('SELECT * FROM reminders WHERE chat_id = ? ORDER BY created_at ASC');
-        return stmt.all(chatId);
+        return stmt.all(chatId).map(reminder => ({
+            ...reminder,
+            lembrar: Boolean(reminder.lembrar) // Converte 0/1 para boolean ao ler
+        }));
     },
     
     add: (chatId, reminder) => {
@@ -97,7 +100,9 @@ const remindersDb = {
             INSERT INTO reminders (chat_id, title, date_iso, lembrar)
             VALUES (?, ?, ?, ?)
         `);
-        return stmt.run(chatId, reminder.title, reminder.date_iso, reminder.lembrar);
+        // Converte boolean para 1/0 ao salvar
+        const lembrarAsInt = reminder.lembrar ? 1 : 0;
+        return stmt.run(chatId, reminder.title, reminder.date_iso, lembrarAsInt);
     },
     
     remove: (chatId, index) => {
