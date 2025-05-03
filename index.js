@@ -714,6 +714,11 @@ async function handleRemovingReminder(message, index) {
 
     const removedReminder = remindersDb.remove(from, index);
     if (removedReminder) {
+        // Remove o cron correspondente se existir
+        if (removedReminder.date_iso) {
+            cronsDb.remove(from, removedReminder.date_iso, `🔔 Lembrete: ${removedReminder.title}`);
+        }
+        
         await sendMessage(from, `✅ Lembrete "${removedReminder.title}" removido com sucesso!\n\nO que deseja fazer agora?\n${showOptionsForState(STATES.REMINDERS_MENU)}`);
         userStates.set(from, { context: CONTEXTS.REMINDERS, state: STATES.REMINDERS_MENU });
     } else {
